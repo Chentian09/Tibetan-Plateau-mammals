@@ -1,0 +1,63 @@
+#Metagenomic quality filtering
+fastp -i ${i}_1.fastq -I ${i}_2.fastq -o ${i}_clean.1.fastq -O ${i}_clean.2.fastq -z 5 -q 20 -u 30 -w 8 -h $i.html -j $i.json
+bowtie2 -x Host_genomic.fna -1 ${i}_clean.1.fastq -2 ${i}_clean.2.fastq -p 30 -S $i.sam --un-conc-gz $i.rmhost.fastq
+
+#Metagenomic assembly
+megahit -1 $i.rmhost.1.fq.gz -2 $i.rmhost.2.fq.gz -t 10 -o $i.directory 
+
+#Genome binning
+seqkit seq -m 1500 {sample_contig} > {sample_contig_filter}
+bowtie2-build {sample_contig_filter} {sample_contig_index} 1> {sample_bowtie2_index.log}
+bowtie2 -p 8 -x {sample_contig_index} -1 {sample.rmhost.1.fq.gz} -2 {sample.rmhost.2.fq.gz} > {smaple.sam}
+samtools sort -@ 8 {sample.sam} -O BAM > {sample.bam}
+samtools index {sample.bam} {smaple.bam.bai}
+
+cut_up_fasta.py {sample_contig_filter} -c 10000 -o 0 --merge_last -b {sample_contigs_10K.bed} > {smaple_contigs_10K.fa}
+concoct_coverage_table.py {sample_contigs_10K.bed} {sample.bam} > {sample_coverage_table.tsv}
+concoct -t 8 --composition_file {sample_contigs_10K.fa} --coverage_file {sample_coverage_table.tsv} -b {sample_concoct_output}
+merge_cutup_clustering.py {sample_clustering_gt1000.csv} > {sample_clustering_merged.csv}
+extract_fasta_bins.py {sample_contig_filter} {sample_clustering_merged.csv} --output_path {fasta_bins}
+
+pileup.sh in={sample.sam} out={sample_cov.txt}
+rm {sample.sam}
+awk '{print $1"\t"$2}' {sample_cov.txt} | grep -v '^#' > {sample_abundance.txt}
+run_MaxBin.pl -thread 8 -contig {sample_contig_filter} -out {sample_maxbin2_out} -abund {sample_abundance.txt}
+
+jgi_summarize_bam_contig_depths {sample.bam} --outputDepth {sample.depth}
+metabat2 -i {sample_contig_filter} -a {sample.depth} -o {sample.binning} -m 1500 -t 8 > {sample_binning_metabat2.log}
+
+prodigal {sample_contig_filter} -p meta -a {sample.prodigal.faa} -d {sample.prodigal.ffn} -o {sample_tmpfile}
+hmmsearch -o {sample.hmm.tigr.out} --tblout {sample.hmm.tigr.hit.out} --noali --notextw --cut_nc --cpu 8 gtdbtk_rel214_tigrfam.hmm {sample.prodigal.faa}
+hmmsearch -o {sample.hmm.pfam.out} --tblout {sample.hmm.pfam.hit.out} --noali --notextw --cut_nc --cpu 8 gtdbtk_rel214_Pfam-A.hmm {sample.prodigal.faa}
+cat {sample.hmm.tigr.hit.out} | grep -v "^#" | awk '{print $1"\t"$3"\t"$5}' > {sample.tigr}
+cat {sample.hmm.pfam.hit.out} | grep -v "^#" | awk '{print $1"\t"$4"\t"$5}' > {sample.pfam}
+cat {sample.pfam} {sample.tigr} > {sample.hmm}
+sh Fasta_to_Contig2Bin.sh -i {sample_maxbin2_bins} -e fasta > {sample.maxbin2.contigs2bin.tsv}
+sh Fasta_to_Contig2Bin.sh -i {sample_metabat2_bins} -e fa > {sample.metabat2.contigs2bin.tsv}
+sh Fasta_to_Contig2Bin.sh -i {sample_concoct_bins} -e fa > {sample.concoct.contigs2bin.tsv}
+awk '{print $2"\t"$1"\tmaxbin2"}'  {sample.maxbin2.contigs2bin.tsv} >> {sample.contigs_to_bin.tsv}
+awk '{print $2"\t"$1"\tmetabat2"}'  {sample.metabat2.contigs2bin.tsv} >> {sample.contigs_to_bin.tsv}
+awk '{print $2"\t"$1"\tconcoct"}'  {sample.concoct.contigs2bin.tsv} >> {sample.contigs_to_bin.tsv}
+Rscript MAGScoT.R -i {sample.contigs_to_bin.tsv} --hmm {sample.hmm} -o {sample.MAGScoT}
+
+#Genome quality assessment
+checkm2 predict --input genomes/ --output-directory genomes.checkm2 --threads 30 -x fa --database_path ~/Database/CheckM2_database/uniref100.KO.1.dmnd
+barrnap --kingdom bac -threads 8 $i.fa --reject 0.01 --evalue 1e-03 >$i.gff3
+tRNAscan-SE -B -o $i.out -m $i.stats  $i.fa
+gunc run -r ~/Database/gunc_db_progenomes2.1.dmnd -d genomes/ -t 30 -o genomes.gunc/ --detailed_output
+
+#SGBs quantification
+dRep dereplicate genome_directory --length 50000 --completeness 50 --contamination 5 --genomeInfo genomeInfo.csv --MASH_sketch 10000 --S_algorithm ANImf --P_ani 0.90 --S_ani 0.95 --cov_thresh 0.3 -p 32 -g *fa
+coverm genome --coupled $i.rmhost.1.fq.gz $i.rmhost.1.fq.gz -d dereplicated_genomes/ -x fa -o $i.tsv --min-read-percent-identity 95 --min-read-aligned-percent 90 -t 32 -m tpm
+
+#Genome annotation
+gtdbtk classify_wf --cpus 32 --genome_dir genome_directory --extension fa --out_dir GTDB_output --skip_ani_screen --keep_intermediates --pplacer_cpus 32
+diamond blastp -d SARG.dmnd -q genome.faa -e 1e-7 --subject-cover 75 --query-cover 75  --sensitive --max-target-seqs 1 --id 80  -f 6 -o ARG.m6
+
+#ARGs annotation
+args_oap stage_one -i $i -o $i.result -f fastq.gz -t 24
+args_oap stage_two -i $i.result -t 24
+
+#Community-level horizontal gene transfer identification
+MetaCHIP PI -p ARG -g Animals.list -i MAGs/ -x fa -t 20
+MetaCHIP BP -p ARG -g  Animals.list -t 20 -pfr
